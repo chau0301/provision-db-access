@@ -740,6 +740,37 @@ admin_conn_fail() {
   die_code "$EXIT_ADMIN_CONN" "Không kết nối được bằng admin '${ADMIN_USER}'. Chưa có gì bị thay đổi."
 }
 
+set_db_list() {
+  # set_db_list "a, b" | "all" → DB_LIST (bỏ trùng, giữ thứ tự), DB_ALL, DB_NAME (chuỗi hiển thị)
+  local raw="$1" d seen=" "
+  DB_LIST=()
+  if [[ "${raw,,}" == "all" ]]; then DB_ALL="yes"; DB_NAME="all"; return 0; fi
+  DB_ALL="no"
+  IFS=',' read -r -a parts <<<"$raw"
+  for d in "${parts[@]}"; do
+    d="$(trim "$d")"
+    [[ -n "$d" && "$seen" != *" $d "* ]] || continue
+    DB_LIST+=("$d"); seen+="$d "
+  done
+  DB_NAME="$(IFS=,; printf '%s' "${DB_LIST[*]}")"; DB_NAME="${DB_NAME//,/, }"
+}
+
+resolve_db_list() {
+  # resolve_db_list "<danh sách DB đang có, mỗi dòng 1 tên>" → kiểm tra DB_LIST / bung "all"
+  local existing="$1" d missing=()
+  if [[ "$DB_ALL" == "yes" ]]; then
+    mapfile -t DB_LIST < <(grep -v '^[[:space:]]*$' <<<"$existing")
+    (( ${#DB_LIST[@]} > 0 )) || die "Không có database nào (ngoài DB hệ thống) để cấp quyền."
+    DB_NAME="$(IFS=,; printf '%s' "${DB_LIST[*]}")"; DB_NAME="${DB_NAME//,/, }"
+    ok "Database (all): ${DB_NAME}"
+    return 0
+  fi
+  for d in "${DB_LIST[@]}"; do grep -qxF -- "$d" <<<"$existing" || missing+=("$d"); done
+  (( ${#missing[@]} == 0 )) || die "Database không tồn tại: ${missing[*]}. Chưa có gì bị thay đổi."
+  if (( ${#DB_LIST[@]} == 1 )); then ok "Database '${DB_LIST[0]}' tồn tại"
+  else ok "${#DB_LIST[@]} database tồn tại: ${DB_NAME}"; fi
+}
+
 collect_conn_info() {
   # Engine quyết định cú pháp SQL / port → không cho chọn mặc định, tránh nhấn Enter nhầm
   CHOOSE_NO_DEFAULT=1 choose ENGINE_IDX "DB engine:" "MySQL" "MariaDB" "PostgreSQL"
@@ -777,7 +808,10 @@ gen_sql() {
         else
           printf "ALTER USER '%s'@'%s' IDENTIFIED BY '%s' WITH MAX_USER_CONNECTIONS %s;\n" "$u" "$h" "$p" "$CONN_LIMIT"
         fi
-        printf "GRANT %s ON \`%s\`.* TO '%s'@'%s';\n" "$privs" "$DB_NAME" "$u" "$h"
+        local d
+        for d in "${DB_LIST[@]}"; do
+          printf "GRANT %s ON \`%s\`.* TO '%s'@'%s';\n" "$privs" "$d" "$u" "$h"
+        done
         ;;
       postgres)
         role="$(pg_ident "$NEW_DB_USER")"; pw="$(pg_str "$NEW_DB_PASS")"
@@ -794,19 +828,31 @@ gen_sql() {
         else
           printf "ALTER ROLE %s WITH LOGIN PASSWORD '%s' CONNECTION LIMIT %s;\n" "$role" "$pw" "$CONN_LIMIT"
         fi
-        printf 'GRANT CONNECT ON DATABASE %s TO %s;\n\n' "$(pg_ident "$DB_NAME")" "$role"
-        printf -- '-- Phần 2: chạy TRONG database đích (psql tự chuyển nhờ \\connect;\n'
-        printf -- '--         nếu dùng DBeaver: mở connection vào đúng database rồi chạy phần dưới)\n'
-        printf '\\connect %s\n' "$(pg_ident "$DB_NAME")"
-        for s in "${PG_SCHEMAS[@]}"; do
-          s="$(pg_ident "$s")"
-          printf 'GRANT %s ON SCHEMA %s TO %s;\n' "$schema_privs" "$s" "$role"
-          printf 'GRANT %s ON ALL TABLES IN SCHEMA %s TO %s;\n' "$privs" "$s" "$role"
-          printf 'ALTER DEFAULT PRIVILEGES %sIN SCHEMA %s GRANT %s ON TABLES TO %s;\n' "$owner_clause" "$s" "$privs" "$role"
-          if [[ "$ACCESS_MODE" != "readonly" ]]; then
-            printf 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s;\n' "$s" "$role"
-            printf 'ALTER DEFAULT PRIVILEGES %sIN SCHEMA %s GRANT USAGE, SELECT ON SEQUENCES TO %s;\n' "$owner_clause" "$s" "$role"
+        local d schemas=()
+        for d in "${DB_LIST[@]}"; do
+          printf 'GRANT CONNECT ON DATABASE %s TO %s;\n' "$(pg_ident "$d")" "$role"
+        done
+        printf '\n-- Phần 2: chạy TRONG từng database đích (psql tự chuyển nhờ \\connect;\n'
+        printf -- '--         nếu dùng DBeaver: mở connection vào đúng database rồi chạy khối tương ứng)\n'
+        for d in "${DB_LIST[@]}"; do
+          # Schema thực có trong DB này (kiểm tra lúc kết nối admin); chưa kiểm tra → dùng danh sách đã nhập
+          if [[ -n "${PG_SCHEMAS_BY_DB[$d]+x}" ]]; then
+            read -r -a schemas <<<"${PG_SCHEMAS_BY_DB[$d]}"
+          else
+            schemas=("${PG_SCHEMAS[@]}")
           fi
+          printf '\\connect %s\n' "$(pg_ident "$d")"
+          (( ${#schemas[@]} > 0 )) || printf -- '-- (không có schema nào trong danh sách → chỉ có quyền CONNECT)\n'
+          for s in "${schemas[@]}"; do
+            s="$(pg_ident "$s")"
+            printf 'GRANT %s ON SCHEMA %s TO %s;\n' "$schema_privs" "$s" "$role"
+            printf 'GRANT %s ON ALL TABLES IN SCHEMA %s TO %s;\n' "$privs" "$s" "$role"
+            printf 'ALTER DEFAULT PRIVILEGES %sIN SCHEMA %s GRANT %s ON TABLES TO %s;\n' "$owner_clause" "$s" "$privs" "$role"
+            if [[ "$ACCESS_MODE" != "readonly" ]]; then
+              printf 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s;\n' "$s" "$role"
+              printf 'ALTER DEFAULT PRIVILEGES %sIN SCHEMA %s GRANT USAGE, SELECT ON SEQUENCES TO %s;\n' "$owner_clause" "$s" "$role"
+            fi
+          done
         done
         # Postgres chỉ cho OWNER của bảng ALTER/DROP nó. Cho user ddl làm thành viên role owner
         # để migration sửa được cả các bảng đã có sẵn (do owner tạo).
@@ -1470,6 +1516,7 @@ esac
 log "Scope: DO_DB_USER=${DO_DB_USER} DO_TUNNEL=${DO_TUNNEL}"
 
 # Giá trị mặc định cho tổng kết
+DB_LIST=(); DB_ALL="no"; declare -A PG_SCHEMAS_BY_DB=()
 ACCESS_MODE="—"; DB_NAME="—"; NEW_DB_USER="—"; NEW_DB_PASS=""; SQL_FILE="—"; RUN_MODE="skipped"
 MYSQL_HOST_PART="%"; PG_OWNER=""; PG_GRANT_OWNER="yes"; PG_SCHEMAS=(public); CONN_LIMIT=20
 TUNNEL_OS_USER=""; KEY_OUT=""; KEY_PUB=""; PUBLIC_IP=""; TUNNEL_TARGET=""
@@ -1493,9 +1540,17 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
   fi
 
   blank
-  ask DB_NAME "Database" "" '^[A-Za-z0-9_$-]{1,64}$' "Chỉ dùng chữ, số, _ , - , \$ (tối đa 64 ký tự)."
+  note "Nhiều database: cách nhau dấu phẩy (vd: appdb, reportdb) · all = mọi database (trừ DB hệ thống)"
+  # Mặc định all khi chạy tương tác (Enter = mọi database). Chạy --yes thì KHÔNG mặc định:
+  # phải ghi rõ --database (kể cả --database all), tránh lặng lẽ cấp quyền trên mọi DB.
+  DB_DEFAULT="all"; (( NONINTERACTIVE )) && DB_DEFAULT=""
+  ask DB_NAME "Database" "$DB_DEFAULT" '^([Aa][Ll][Ll]|[A-Za-z0-9_$-]{1,64}([[:space:]]*,[[:space:]]*[A-Za-z0-9_$-]{1,64})*)$' \
+    "Tên database chỉ gồm chữ, số, _ - \$ (tối đa 64 ký tự), cách nhau dấu phẩy; hoặc all."
+  set_db_list "$DB_NAME"
+  # 1 database → gợi ý <mode>_<db>; nhiều database / all → bắt nhập tên (không có tên mặc định hợp lý)
+  local_user_default=""; (( ${#DB_LIST[@]} == 1 )) && local_user_default="${ACCESS_MODE}_${DB_LIST[0]}"
   while true; do
-    ask NEW_DB_USER "DB user mới" "${ACCESS_MODE}_${DB_NAME}" '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$' \
+    ask NEW_DB_USER "DB user mới" "$local_user_default" '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$' \
       "Chỉ dùng chữ, số, _ . - (tối đa 32 ký tự)."
     # Tên có tiền tố "<mức quyền>_" khác ACCESS_MODE đang chọn → dễ cấp nhầm cho user khác
     name_prefix="${NEW_DB_USER%%_*}"
@@ -1515,7 +1570,7 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
     PG_OWNER=""
   else
     if [[ "$ACCESS_MODE" == "ddl" ]]; then
-      warn "MySQL: quyền DROP trên \`${DB_NAME}\`.* cho phép cả DROP DATABASE ${DB_NAME}."
+      warn "MySQL: quyền DROP trên \`<db>\`.* cho phép cả DROP DATABASE <db> (${DB_NAME})."
     fi
     note "Host part: % = mọi nơi · giới hạn IP/subnet: 10.0.%"
     ask MYSQL_HOST_PART "Host part" "%" '^[A-Za-z0-9.%_:-]+$' "Host part không hợp lệ."
@@ -1540,18 +1595,26 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
   # ---------------------------------------------------------------------
   step "Sinh SQL"
   SQL_FILE="${OUT_DIR}/create_user_${NEW_DB_USER}.sql"
-  gen_sql create
-  ok "SQL: ${SQL_FILE}"
+  if [[ "$DB_ALL" == "yes" ]]; then
+    info "Database = all → SQL sẽ sinh sau khi kết nối admin và lấy được danh sách database."
+  else
+    gen_sql create
+    ok "SQL: ${SQL_FILE}"
+  fi
 
   # ---------------------------------------------------------------------
   step "Thực thi SQL"
-  if ! confirm "Tự chạy SQL? (cần admin DB)" n "$([[ -n "${OPT[sql-only]:-}" ]] && echo n || echo y)"; then
+  if [[ "$DB_ALL" == "yes" ]]; then
+    [[ -z "${OPT[sql-only]:-}" ]] || die_code "$EXIT_USAGE" "Database = all cần kết nối admin để lấy danh sách → không dùng được với --sql-only."
+    info "Database = all → bắt buộc tự chạy (cần admin để lấy danh sách database)."
+  fi
+  if [[ "$DB_ALL" != "yes" ]] && ! confirm "Tự chạy SQL? (cần admin DB)" n "$([[ -n "${OPT[sql-only]:-}" ]] && echo n || echo y)"; then
     RUN_MODE="manual"
     info "Chạy tay file SQL dưới đây:"
     show_sql_masked
     if [[ "$DB_ENGINE" == "postgres" ]]; then
       note "psql:    psql -h ${DB_HOST} -p ${DB_PORT} -U <admin> -d postgres -f ${SQL_FILE}"
-      note "DBeaver: chạy Phần 1 ở DB 'postgres', Phần 2 ở DB '${DB_NAME}' (bỏ dòng \\connect)"
+      note "DBeaver: chạy Phần 1 ở DB 'postgres', mỗi khối Phần 2 ở đúng DB của nó (bỏ dòng \\connect)"
     else
       note "mysql:   mysql -h ${DB_HOST} -P ${DB_PORT} -u <admin> -p < ${SQL_FILE}"
     fi
@@ -1585,10 +1648,11 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
           confirm "Vẫn dùng '${ADMIN_USER}'?" n "fail:${EXIT_ADMIN_PRIV}:Admin '${ADMIN_USER}' thiếu quyền CREATE USER." || die "Dừng lại. Chưa có gì bị thay đổi."
         fi
 
-        DB_COUNT="$(run_mysql "$ADMIN_CNF" -N -B -e \
-          "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(mysql_str "$DB_NAME")';" 2>>"$LOG_FILE")"
-        [[ "$DB_COUNT" == "1" ]] || die "Database '${DB_NAME}' không tồn tại. Chưa có gì bị thay đổi."
-        ok "Database '${DB_NAME}' tồn tại"
+        EXISTING_DBS="$(run_mysql "$ADMIN_CNF" -N -B -e \
+          "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+            WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys')
+            ORDER BY 1;" 2>>"$LOG_FILE")" || die "Không đọc được danh sách database bằng admin '${ADMIN_USER}'."
+        resolve_db_list "$EXISTING_DBS"
         # Admin không phải root thường KHÔNG có SELECT trên mysql.user → không coi là lỗi,
         # chỉ bỏ qua bước kiểm tra; lúc chạy CREATE USER sẽ bắt lỗi 1396 (user đã tồn tại).
         if USER_COUNT="$(run_mysql "$ADMIN_CNF" -N -B -e \
@@ -1604,10 +1668,24 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
         CONN_OUT="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc "SELECT 1;" 2>&1)" \
           || admin_conn_fail "$CONN_OUT"
         ok "Kết nối admin OK"
-        DB_FOUND="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc \
-          "SELECT 1 FROM pg_database WHERE datname='$(pg_str "$DB_NAME")';" 2>>"$LOG_FILE")"
-        [[ "$DB_FOUND" == "1" ]] || die "Database '${DB_NAME}' không tồn tại. Chưa có gì bị thay đổi."
-        ok "Database '${DB_NAME}' tồn tại"
+        EXISTING_DBS="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc \
+          "SELECT datname FROM pg_database
+            WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('postgres','rdsadmin')
+            ORDER BY 1;" 2>>"$LOG_FILE")" || die "Không đọc được danh sách database bằng admin '${ADMIN_USER}'."
+        resolve_db_list "$EXISTING_DBS"
+        # Schema đã nhập có thể không có ở mọi DB → chỉ cấp trên schema thực có, báo phần bỏ qua
+        local_schema_csv="$(printf "'%s'," "${PG_SCHEMAS[@]}")"; local_schema_csv="${local_schema_csv%,}"   # tên schema đã validate [A-Za-z0-9_]
+        for d in "${DB_LIST[@]}"; do
+          found="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d "$d" -tAc \
+            "SELECT string_agg(nspname, ' ' ORDER BY nspname) FROM pg_namespace WHERE nspname IN (${local_schema_csv});" 2>>"$LOG_FILE" || true)"
+          PG_SCHEMAS_BY_DB[$d]="$found"
+          schema_missing=""
+          for sc in "${PG_SCHEMAS[@]}"; do [[ " $found " == *" $sc "* ]] || schema_missing+="${sc} "; done
+          if [[ -n "$schema_missing" ]]; then
+            if [[ -z "$found" ]]; then warn "DB '${d}': không có schema ${schema_missing% } → chỉ cấp CONNECT."
+            else warn "DB '${d}': bỏ qua schema không tồn tại: ${schema_missing% }"; fi
+          fi
+        done
         ROLE_FOUND="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc \
           "SELECT 1 FROM pg_roles WHERE rolname='$(pg_str "$NEW_DB_USER")';" 2>>"$LOG_FILE")"
         [[ "$ROLE_FOUND" == "1" ]] && USER_EXISTS="yes"
@@ -1640,6 +1718,10 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
         fi
         ;;
     esac
+
+    # Danh sách DB (và schema theo DB) đã chốt → sinh lại SQL theo đúng danh sách đó
+    gen_sql create
+    [[ "$DB_ALL" == "yes" ]] && ok "SQL: ${SQL_FILE}"   # lần đầu sinh SQL với all; còn lại: sinh lại lặng lẽ
 
     if [[ "$USER_EXISTS" == "yes" ]]; then
       warn "User '${NEW_DB_USER}' đã tồn tại."
@@ -1710,11 +1792,15 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
           >"$GRANTS_FILE" 2>>"$LOG_FILE" && VERIFY_STATUS="ok" || VERIFY_STATUS="fail"
         ;;
       postgres)
-        run_psql "$ADMIN_USER" "$ADMIN_PASS" -d "$DB_NAME" -c \
-          "SELECT table_schema, privilege_type, count(*) AS tables
-             FROM information_schema.role_table_grants
-            WHERE grantee = '$(pg_str "$NEW_DB_USER")'
-            GROUP BY 1, 2 ORDER BY 1, 2;" >"$GRANTS_FILE" 2>>"$LOG_FILE" && VERIFY_STATUS="ok" || VERIFY_STATUS="fail"
+        VERIFY_STATUS="ok"; : >"$GRANTS_FILE"
+        for d in "${DB_LIST[@]}"; do
+          (( ${#DB_LIST[@]} > 1 )) && printf '== %s\n' "$d" >>"$GRANTS_FILE"
+          run_psql "$ADMIN_USER" "$ADMIN_PASS" -d "$d" -c \
+            "SELECT table_schema, privilege_type, count(*) AS tables
+               FROM information_schema.role_table_grants
+              WHERE grantee = '$(pg_str "$NEW_DB_USER")'
+              GROUP BY 1, 2 ORDER BY 1, 2;" >>"$GRANTS_FILE" 2>>"$LOG_FILE" || VERIFY_STATUS="fail"
+        done
         ;;
     esac
     if [[ "$VERIFY_STATUS" == "ok" ]]; then codeblock "$(<"$GRANTS_FILE")"; else warn "Không lấy được danh sách quyền."; fi
@@ -1731,33 +1817,39 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
         fi
         ;;
       postgres)
-        if run_psql "$NEW_DB_USER" "$NEW_DB_PASS" -d "$DB_NAME" -c "SELECT current_user, now();" >"$LOGIN_FILE" 2>&1; then
-          LOGIN_STATUS="ok"; ok "Login OK"
+        # Mỗi DB cần quyền CONNECT riêng → login + test CREATE TABLE trên từng DB
+        if [[ "$ACCESS_MODE" == "ddl" ]]; then PROBE_Q="tạo được"; else PROBE_Q="bị chặn"; fi
+        DO_PROBE="no"
+        confirm "Test CREATE TABLE trên ${#DB_LIST[@]} DB? (rollback · mong đợi: ${PROBE_Q})" y y && DO_PROBE="yes"
+        LOGIN_STATUS="ok"; : >"$LOGIN_FILE"
+        for d in "${DB_LIST[@]}"; do
+          printf '== %s\n' "$d" >>"$LOGIN_FILE"
+          if ! run_psql "$NEW_DB_USER" "$NEW_DB_PASS" -d "$d" -c "SELECT current_user, current_database(), now();" >>"$LOGIN_FILE" 2>&1; then
+            LOGIN_STATUS="fail"; warn "[${d}] Đăng nhập thất bại (kiểm tra pg_hba / Security Group). Chi tiết: ${LOGIN_FILE}"
+            continue
+          fi
           # DDL trong Postgres có transaction => thử CREATE TABLE rồi ROLLBACK, không để lại gì.
-          # readonly/dml: mong đợi KHÔNG tạo được bảng · ddl: mong đợi TẠO ĐƯỢC. Luôn ROLLBACK nên không để lại gì.
-          if [[ "$ACCESS_MODE" == "ddl" ]]; then PROBE_Q="tạo được"; else PROBE_Q="bị chặn"; fi
-          if confirm "Test CREATE TABLE? (rollback · mong đợi: ${PROBE_Q})" y y; then
-            PROBE="$(pg_ident "${PG_SCHEMAS[0]}").$(pg_ident "__perm_probe_${TS}")"
-            if run_psql "$NEW_DB_USER" "$NEW_DB_PASS" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-                 -c "BEGIN;" -c "CREATE TABLE ${PROBE} (x int);" -c "ROLLBACK;" >>"$LOGIN_FILE" 2>&1; then
-              if [[ "$ACCESS_MODE" == "ddl" ]]; then
-                ok "CREATE TABLE được (đã rollback) ✓"
-              else
-                LOGIN_STATUS="ok (⚠ tạo được bảng)"
-                warn "User TẠO ĐƯỢC bảng (đã rollback). Xem lại quyền CREATE trên schema ${PG_SCHEMAS[0]}."
-              fi
+          if [[ -n "${PG_SCHEMAS_BY_DB[$d]+x}" ]]; then read -r -a probe_schemas <<<"${PG_SCHEMAS_BY_DB[$d]}"
+          else probe_schemas=("${PG_SCHEMAS[@]}"); fi
+          if [[ "$DO_PROBE" != "yes" || ${#probe_schemas[@]} -eq 0 ]]; then ok "[${d}] Login OK"; continue; fi
+          PROBE="$(pg_ident "${probe_schemas[0]}").$(pg_ident "__perm_probe_${TS}")"
+          if run_psql "$NEW_DB_USER" "$NEW_DB_PASS" -d "$d" -v ON_ERROR_STOP=1 \
+               -c "BEGIN;" -c "CREATE TABLE ${PROBE} (x int);" -c "ROLLBACK;" >>"$LOGIN_FILE" 2>&1; then
+            if [[ "$ACCESS_MODE" == "ddl" ]]; then
+              ok "[${d}] Login OK · CREATE TABLE được (đã rollback) ✓"
             else
-              if [[ "$ACCESS_MODE" == "ddl" ]]; then
-                LOGIN_STATUS="ok (⚠ không tạo được bảng)"
-                warn "User ddl KHÔNG tạo được bảng trong schema ${PG_SCHEMAS[0]}. Chi tiết: ${LOGIN_FILE}"
-              else
-                ok "CREATE TABLE bị chặn ✓"
-              fi
+              LOGIN_STATUS="ok (⚠ tạo được bảng)"
+              warn "[${d}] User TẠO ĐƯỢC bảng (đã rollback). Xem lại quyền CREATE trên schema ${probe_schemas[0]}."
+            fi
+          else
+            if [[ "$ACCESS_MODE" == "ddl" ]]; then
+              LOGIN_STATUS="ok (⚠ không tạo được bảng)"
+              warn "[${d}] User ddl KHÔNG tạo được bảng trong schema ${probe_schemas[0]}. Chi tiết: ${LOGIN_FILE}"
+            else
+              ok "[${d}] Login OK · CREATE TABLE bị chặn ✓"
             fi
           fi
-        else
-          LOGIN_STATUS="fail"; warn "Đăng nhập thất bại (kiểm tra pg_hba / Security Group). Chi tiết: ${LOGIN_FILE}"
-        fi
+        done
         ;;
     esac
   fi
@@ -1774,8 +1866,8 @@ if [[ "$DO_TUNNEL" == "yes" ]]; then
   step "Thông tin SSH tunnel account"
   # Gợi ý tên: <database>${TUNNEL_SUFFIX}, chuẩn hoá theo luật đặt tên user Linux, tổng ≤ OS_USER_MAX
   TUNNEL_USER_DEFAULT=""
-  if [[ -n "${DB_NAME:-}" && "$DB_NAME" != "—" ]]; then
-    base="${DB_NAME,,}"                                  # chữ thường
+  if (( ${#DB_LIST[@]} > 0 )); then
+    base="${DB_LIST[0],,}"                                  # chữ thường
     base="$(printf '%s' "$base" | sed -E 's/[^a-z0-9_-]+/-/g; s/-+/-/g; s/^[^a-z]+//; s/[-_]+$//')"
     base="${base:0:$(( OS_USER_MAX - ${#TUNNEL_SUFFIX} ))}"; base="${base%-}"
     [[ -n "$base" ]] && TUNNEL_USER_DEFAULT="${base}${TUNNEL_SUFFIX}"
@@ -2116,7 +2208,7 @@ log "===== Hoàn tất ====="
 emit_json status ok action create \
   scope "$(case "$SCOPE_IDX" in 1) echo both ;; 2) echo db ;; 3) echo tunnel ;; esac)" \
   engine "${DB_ENGINE:-}" host "${DB_HOST:-}" port "${DB_PORT:-}" \
-  database "$DB_NAME" db_user "$NEW_DB_USER" access "$ACCESS_MODE" run_sql "$RUN_MODE" \
+  database "$DB_NAME" databases "$(json_array "${DB_LIST[@]}")" db_user "$NEW_DB_USER" access "$ACCESS_MODE" run_sql "$RUN_MODE" \
   verify_grants "$VERIFY_STATUS" login_test "$LOGIN_STATUS" sql_file "$SQL_FILE" \
   tunnel_user "${TUNNEL_OS_USER:-}" tunnel_target "${TUNNEL_TARGET:-}" private_key "${KEY_OUT:-}" \
   credentials_file "$CRED_FILE" output_dir "$OUT_DIR" changes_file "$CHANGES_FILE" log_file "$LOG_FILE"
