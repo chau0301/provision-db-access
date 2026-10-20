@@ -156,6 +156,15 @@ banner() {
   pad=$(( BOX_INNER - 2 - ${#title} - ${#ver} - 2 )); (( pad < 1 )) && pad=1
   printf '%s│%s  %s%s%s%*s%s  %s│%s\n' "$MAGENTA" "$RESET" "$BOLD" "$title" "$RESET" "$pad" "" "$ver" "$MAGENTA" "$RESET" >&2
   printf '%s│%s  %sMySQL · MariaDB · PostgreSQL  —  Ubuntu · Amazon Linux%s  %s│%s\n' "$MAGENTA" "$RESET" "$DIM" "$RESET" "$MAGENTA" "$RESET" >&2
+  # Dòng hệ điều hành của server đang chạy: "<PRETTY_NAME> · kernel <uname -r>", cắt bớt nếu quá dài
+  local os_line os_len os_max=$(( BOX_INNER - 4 ))
+  os_line="$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-${ID:-Linux}}") || printf 'Linux')"
+  os_line="${os_line} · kernel $(uname -r 2>/dev/null || echo '?')"
+  os_len="$(LC_ALL=C.UTF-8 bash -c 'printf "%s" "${#1}"' _ "$os_line" 2>/dev/null || printf '%s' "${#os_line}")"
+  if (( os_len > os_max )); then
+    os_line="$(LC_ALL=C.UTF-8 bash -c 'printf "%s…" "${1:0:$2}"' _ "$os_line" "$(( os_max - 1 ))")"; os_len=$os_max
+  fi
+  printf '%s│%s  %s%s%*s  %s│%s\n' "$MAGENTA" "$RESET" "$os_line" "$RESET" "$(( os_max - os_len ))" "" "$MAGENTA" "$RESET" >&2
   printf '%s╰──────────────────────────────────────────────────────────╯%s\n' "$MAGENTA" "$RESET" >&2
 }
 
@@ -575,7 +584,8 @@ install_pkg() {
 require_cmd_or_install() {
   # require_cmd_or_install <cmd> <pkg-ubuntu> <pkg-amzn>
   local cmd="$1" pkg
-  if command -v "$cmd" >/dev/null 2>&1; then ok "${cmd}: có sẵn"; return 0; fi
+  # CMD_QUIET=1: đã có thì không in gì (dùng khi kiểm tra sớm ở bước 1; bước 2 mới báo "có sẵn")
+  if command -v "$cmd" >/dev/null 2>&1; then [[ -n "${CMD_QUIET:-}" ]] || ok "${cmd}: có sẵn"; return 0; fi
   if [[ "$OS_FAMILY" == "ubuntu" ]]; then pkg="$2"; else pkg="$3"; fi
   warn "Chưa có '${cmd}' (gói: ${pkg})."
   confirm "Cài ${pkg}? (chỉ client)" n y || die "Cần '${cmd}' để tiếp tục."
@@ -600,18 +610,52 @@ find_ssh_service() {
   printf ''
 }
 
-get_public_ip() {
-  # Thử EC2 IMDSv2 (timeout ngắn), không có thì trả placeholder
-  local token="" ip=""
+find_ssh_connection() {
+  # SSH_CONNECTION = "<ip client> <port client> <ip server> <port server>" của phiên SSH đang chạy script.
+  # sudo / `script` thường xoá biến này → dò ngược lên các tiến trình cha (root đọc được /proc/*/environ).
+  local pid="$$" v=""
+  [[ -n "${SSH_CONNECTION:-}" ]] && { printf '%s' "$SSH_CONNECTION"; return 0; }
+  while [[ -n "$pid" && "$pid" -gt 1 ]]; do
+    v="$(tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n 1)"
+    [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+    pid="$(awk '/^PPid:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
+  done
+  return 0
+}
+
+detect_server_ip() {
+  # Gán PUBLIC_IP + IP_SOURCE (không in ra; gọi trực tiếp, không qua $(...))
+  # IP để người dùng SSH vào server, theo thứ tự ưu tiên:
+  #   1. IP server trong phiên SSH bạn đang dùng (đúng địa chỉ bạn vừa SSH vào: LAN, VPN hay public)
+  #   2. Public IPv4 của EC2 (IMDSv2)
+  #   3. IP của card mạng ra Internet (route mặc định)
+  # Ghi nguồn vào IP_SOURCE để hiển thị. Không tìm được → placeholder.
+  local ip="" token="" re='^[0-9]{1,3}(\.[0-9]{1,3}){3}$' conn
+  conn="$(find_ssh_connection)"
+  if [[ -n "$conn" ]]; then
+    ip="$(awk '{print $3}' <<<"$conn")"
+    [[ "$ip" =~ $re ]] && { IP_SOURCE="IP bạn đang SSH vào"; PUBLIC_IP="$ip"; return 0; }
+  fi
   if command -v curl >/dev/null 2>&1; then
     token="$(curl -s -m 2 -X PUT 'http://169.254.169.254/latest/api/token' \
       -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
     if [[ -n "$token" ]]; then
       ip="$(curl -s -m 2 -H "X-aws-ec2-metadata-token: ${token}" \
         'http://169.254.169.254/latest/meta-data/public-ipv4' 2>/dev/null || true)"
+      [[ "$ip" =~ $re ]] && { IP_SOURCE="EC2 public IP"; PUBLIC_IP="$ip"; return 0; }
     fi
   fi
-  if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then printf '%s' "$ip"; else printf '%s' "<public-IP-của-server>"; fi
+  # Không phải máy nào cũng có lệnh `ip` (image tối giản) → kiểm tra trước, dự phòng bằng hostname -I
+  ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$( { ip -4 route get 1.1.1.1 2>/dev/null || true; } | sed -nE 's/.* src ([0-9.]+).*/\1/p' | head -n 1)"
+  fi
+  if [[ ! "$ip" =~ $re ]] && command -v hostname >/dev/null 2>&1; then
+    ip="$( { hostname -I 2>/dev/null || true; } | awk '{print $1}')"
+  fi
+  [[ "$ip" =~ $re ]] && { IP_SOURCE="IP card mạng chính"; PUBLIC_IP="$ip"; return 0; }
+  IP_SOURCE="không tự phát hiện được — thay bằng IP thật"
+  PUBLIC_IP="<IP-server>"
 }
 
 tcp_reachable() {
@@ -771,6 +815,68 @@ resolve_db_list() {
   else ok "${#DB_LIST[@]} database tồn tại: ${DB_NAME}"; fi
 }
 
+list_databases() {
+  # In danh sách database (trừ DB hệ thống), mỗi dòng 1 tên; cần ADMIN_USER/ADMIN_PASS (+ ADMIN_CNF cho MySQL)
+  case "$DB_ENGINE" in
+    mysql|mariadb)
+      run_mysql "$ADMIN_CNF" -N -B -e \
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+          WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys')
+          ORDER BY 1;" 2>>"$LOG_FILE" ;;
+    postgres)
+      run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc \
+        "SELECT datname FROM pg_database
+          WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('postgres','rdsadmin')
+          ORDER BY 1;" 2>>"$LOG_FILE" ;;
+  esac
+}
+
+pick_databases() {
+  # Chế độ tương tác: kết nối admin trước → hiện danh sách database để chọn (nhiều / all).
+  # Bỏ trống admin user → quay về gõ tên database (dùng được cả khi không có admin, chạy SQL tay).
+  # Thành công: DB_LIST, DB_NAME, ADMIN_READY=1 (bước Thực thi SQL dùng lại admin này).
+  local out names=() i
+  note "Nhập admin để liệt kê database · bỏ trống user = tự gõ tên database"
+  if [[ -n "${OPT[admin-user]:-}" ]]; then
+    ADMIN_USER="${OPT[admin-user]}"; preset_note "Admin DB user" "$ADMIN_USER" "--admin-user"
+  else
+    ask_optional ADMIN_USER "Admin DB user" '^[A-Za-z0-9_.@-]+$' "Tên user không hợp lệ."
+  fi
+  if [[ -n "$ADMIN_USER" ]]; then
+    case "$DB_ENGINE" in
+      mysql)    CMD_QUIET=1 require_cmd_or_install mysql "mysql-client" "mariadb105" ;;
+      mariadb)  CMD_QUIET=1 require_cmd_or_install mysql "mariadb-client" "mariadb105" ;;
+      postgres) CMD_QUIET=1 require_cmd_or_install psql "postgresql-client" "postgresql15" ;;
+    esac
+    ask_admin_secret ADMIN_PASS "Admin DB password"
+    case "$DB_ENGINE" in
+      mysql|mariadb)
+        make_mycnf ADMIN_CNF "$ADMIN_USER" "$ADMIN_PASS"
+        out="$(run_mysql "$ADMIN_CNF" -N -B -e "SELECT 1;" 2>&1)" || admin_conn_fail "$out" ;;
+      postgres)
+        out="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc "SELECT 1;" 2>&1)" || admin_conn_fail "$out" ;;
+    esac
+    ok "Kết nối admin OK"
+    ADMIN_READY=1
+    out="$(list_databases || true)"
+    mapfile -t names < <(grep -v '^[[:space:]]*$' <<<"$out")
+    if (( ${#names[@]} > 0 )); then
+      blank
+      CHOOSE_MULTI_DEFAULT_ALL=1 choose_multi "Database (đã ẩn DB hệ thống):" "${names[@]}"
+      DB_ALL="no"; DB_LIST=()
+      for i in "${CHOSEN[@]}"; do DB_LIST+=("${names[$i]}"); done
+      DB_NAME="$(IFS=,; printf '%s' "${DB_LIST[*]}")"; DB_NAME="${DB_NAME//,/, }"
+      ok "Đã chọn ${#DB_LIST[@]} database: ${DB_NAME}"
+      return 0
+    fi
+    warn "Không liệt kê được database (thiếu quyền hoặc không có DB nào) → tự gõ tên."
+  fi
+  note "Nhiều database: cách nhau dấu phẩy (vd: appdb, reportdb) · all = mọi database (trừ DB hệ thống)"
+  ask DB_NAME "Database" "all" '^([Aa][Ll][Ll]|[A-Za-z0-9_$-]{1,64}([[:space:]]*,[[:space:]]*[A-Za-z0-9_$-]{1,64})*)$' \
+    "Tên database chỉ gồm chữ, số, _ - \$ (tối đa 64 ký tự), cách nhau dấu phẩy; hoặc all."
+  set_db_list "$DB_NAME"
+}
+
 collect_conn_info() {
   # Engine quyết định cú pháp SQL / port → không cho chọn mặc định, tránh nhấn Enter nhầm
   CHOOSE_NO_DEFAULT=1 choose ENGINE_IDX "DB engine:" "MySQL" "MariaDB" "PostgreSQL"
@@ -905,8 +1011,13 @@ choose_multi() {
   printf '  %s%s%s\n' "$BOLD" "$prompt" "$RESET" >&2
   for (( i = 0; i < n; i++ )); do printf '     %s%d)%s %s\n' "$CYAN" "$((i + 1))" "$RESET" "${opts[$i]}" >&2; done
   while true; do
-    read -r -p "  ${CYAN}›${RESET} Chọn ${DIM}[vd: 1 3 · 2-4 · all]${RESET}: " ans || die "Không đọc được input."
+    if [[ -n "${CHOOSE_MULTI_DEFAULT_ALL:-}" ]]; then
+      read -r -p "  ${CYAN}›${RESET} Chọn ${DIM}[vd: 1 3 · 2-4 · all, Default: all]${RESET}: " ans || die "Không đọc được input."
+    else
+      read -r -p "  ${CYAN}›${RESET} Chọn ${DIM}[vd: 1 3 · 2-4 · all]${RESET}: " ans || die "Không đọc được input."
+    fi
     ans="$(trim "${ans//,/ }")"
+    if [[ -z "$ans" && -n "${CHOOSE_MULTI_DEFAULT_ALL:-}" ]]; then ans="all"; fi
     [[ -n "$ans" ]] || { warn "Bắt buộc chọn ít nhất 1 mục."; continue; }
     sel=()
     if [[ "${ans,,}" == "all" ]]; then
@@ -1516,10 +1627,10 @@ esac
 log "Scope: DO_DB_USER=${DO_DB_USER} DO_TUNNEL=${DO_TUNNEL}"
 
 # Giá trị mặc định cho tổng kết
-DB_LIST=(); DB_ALL="no"; declare -A PG_SCHEMAS_BY_DB=()
+DB_LIST=(); DB_ALL="no"; declare -A PG_SCHEMAS_BY_DB=(); ADMIN_READY=0; ADMIN_USER=""
 ACCESS_MODE="—"; DB_NAME="—"; NEW_DB_USER="—"; NEW_DB_PASS=""; SQL_FILE="—"; RUN_MODE="skipped"
 MYSQL_HOST_PART="%"; PG_OWNER=""; PG_GRANT_OWNER="yes"; PG_SCHEMAS=(public); CONN_LIMIT=20
-TUNNEL_OS_USER=""; KEY_OUT=""; KEY_PUB=""; PUBLIC_IP=""; TUNNEL_TARGET=""
+TUNNEL_OS_USER=""; KEY_OUT=""; KEY_PUB=""; PUBLIC_IP=""; IP_SOURCE=""; TUNNEL_TARGET=""
 VERIFY_STATUS="—"; LOGIN_STATUS="—"
 
 # ============================== DB user ===================================
@@ -1540,13 +1651,15 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
   fi
 
   blank
-  note "Nhiều database: cách nhau dấu phẩy (vd: appdb, reportdb) · all = mọi database (trừ DB hệ thống)"
-  # Mặc định all khi chạy tương tác (Enter = mọi database). Chạy --yes thì KHÔNG mặc định:
-  # phải ghi rõ --database (kể cả --database all), tránh lặng lẽ cấp quyền trên mọi DB.
-  DB_DEFAULT="all"; (( NONINTERACTIVE )) && DB_DEFAULT=""
-  ask DB_NAME "Database" "$DB_DEFAULT" '^([Aa][Ll][Ll]|[A-Za-z0-9_$-]{1,64}([[:space:]]*,[[:space:]]*[A-Za-z0-9_$-]{1,64})*)$' \
-    "Tên database chỉ gồm chữ, số, _ - \$ (tối đa 64 ký tự), cách nhau dấu phẩy; hoặc all."
-  set_db_list "$DB_NAME"
+  if (( NONINTERACTIVE )) || [[ -n "${OPT[database]+x}" ]]; then
+    # Có --database (hoặc chạy --yes): không liệt kê. --yes bắt buộc ghi rõ --database (kể cả all),
+    # tránh lặng lẽ cấp quyền trên mọi DB.
+    ask DB_NAME "Database" "" '^([Aa][Ll][Ll]|[A-Za-z0-9_$-]{1,64}([[:space:]]*,[[:space:]]*[A-Za-z0-9_$-]{1,64})*)$' \
+      "Tên database chỉ gồm chữ, số, _ - \$ (tối đa 64 ký tự), cách nhau dấu phẩy; hoặc all."
+    set_db_list "$DB_NAME"
+  else
+    pick_databases
+  fi
   # 1 database → gợi ý <mode>_<db>; nhiều database / all → bắt nhập tên (không có tên mặc định hợp lý)
   local_user_default=""; (( ${#DB_LIST[@]} == 1 )) && local_user_default="${ACCESS_MODE}_${DB_LIST[0]}"
   while true; do
@@ -1608,7 +1721,7 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
     [[ -z "${OPT[sql-only]:-}" ]] || die_code "$EXIT_USAGE" "Database = all cần kết nối admin để lấy danh sách → không dùng được với --sql-only."
     info "Database = all → bắt buộc tự chạy (cần admin để lấy danh sách database)."
   fi
-  if [[ "$DB_ALL" != "yes" ]] && ! confirm "Tự chạy SQL? (cần admin DB)" n "$([[ -n "${OPT[sql-only]:-}" ]] && echo n || echo y)"; then
+  if [[ "$DB_ALL" != "yes" ]] && ! confirm "Tự chạy SQL? (cần admin DB)" "$( (( ADMIN_READY )) && echo y || echo n )" "$([[ -n "${OPT[sql-only]:-}" ]] && echo n || echo y)"; then
     RUN_MODE="manual"
     info "Chạy tay file SQL dưới đây:"
     show_sql_masked
@@ -1620,9 +1733,13 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
     fi
   else
     RUN_MODE="auto"
-    info "Cần admin DB để chạy SQL → nhập thông tin admin:"
-    ask ADMIN_USER "Admin DB user"
-    ask_admin_secret ADMIN_PASS "Admin DB password"
+    if (( ADMIN_READY )); then
+      info "Dùng admin '${ADMIN_USER}' đã nhập ở bước 1"
+    else
+      info "Cần admin DB để chạy SQL → nhập thông tin admin:"
+      ask ADMIN_USER "Admin DB user"
+      ask_admin_secret ADMIN_PASS "Admin DB password"
+    fi
 
     # --- 1. Test kết nối + kiểm tra hiện trạng (read-only) ---
     info "Kiểm tra admin & hiện trạng…"
@@ -1632,7 +1749,7 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
         make_mycnf ADMIN_CNF "$ADMIN_USER" "$ADMIN_PASS"
         CONN_OUT="$(run_mysql "$ADMIN_CNF" -N -B -e "SELECT 1;" 2>&1)" \
           || admin_conn_fail "$CONN_OUT"
-        ok "Kết nối admin OK"
+        (( ADMIN_READY )) || ok "Kết nối admin OK"   # đã báo ở bước 1
 
         # Kiểm tra quyền admin TRƯỚC khi làm gì: cần CREATE USER (hoặc ALL ON *.*) và GRANT OPTION.
         ADMIN_GRANTS="$(run_mysql "$ADMIN_CNF" -N -B -e "SHOW GRANTS FOR CURRENT_USER();" 2>>"$LOG_FILE" || true)"
@@ -1667,7 +1784,7 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
       postgres)
         CONN_OUT="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc "SELECT 1;" 2>&1)" \
           || admin_conn_fail "$CONN_OUT"
-        ok "Kết nối admin OK"
+        (( ADMIN_READY )) || ok "Kết nối admin OK"   # đã báo ở bước 1
         EXISTING_DBS="$(run_psql "$ADMIN_USER" "$ADMIN_PASS" -d postgres -tAc \
           "SELECT datname FROM pg_database
             WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('postgres','rdsadmin')
@@ -2096,7 +2213,7 @@ if [[ "$DO_TUNNEL" == "yes" ]]; then
     info "${SSH_SVC} không chạy (socket activation?) → áp dụng khi khởi động."
   fi
 
-  PUBLIC_IP="$(get_public_ip)"
+  detect_server_ip
 fi
 
 # ============================== Credentials file ==========================
@@ -2110,7 +2227,7 @@ fi
     printf 'user     = %s\npassword = %s\naccess   = %s\n\n' "$NEW_DB_USER" "$NEW_DB_PASS" "$ACCESS_MODE"
   fi
   if [[ "$DO_TUNNEL" == "yes" ]]; then
-    LOCAL_PORT=$(( TGT_PORT < 55000 ? TGT_PORT + 10000 : TGT_PORT ))
+    LOCAL_PORT="$TGT_PORT"   # cổng local = cổng DB; đổi nếu máy local đã dùng cổng này
     printf '[ssh_tunnel]\n'
     printf 'ssh_host    = %s\nssh_port    = %s\nssh_user    = %s\n' "$PUBLIC_IP" "$SSH_PORT" "$TUNNEL_OS_USER"
     printf 'private_key = %s\ntarget      = %s\n\n' "$(basename "$KEY_OUT")" "$TUNNEL_TARGET"
@@ -2136,8 +2253,24 @@ SUMMARY_BUF="$(mktemp "${OUT_DIR}/.summary.XXXXXX")"; TMP_FILES+=("$SUMMARY_BUF"
 exec 3>&2 2>"$SUMMARY_BUF"
 IN_SUMMARY=1
 
-if [[ "$DO_DB_USER" == "yes" ]]; then
+# Thứ tự: SSH tunnel → DBeaver → Database → File output (đúng thứ tự người dùng cần khi kết nối)
+blank
+if [[ "$DO_TUNNEL" == "yes" ]]; then
+  SSH_P_OPT="";  [[ "$SSH_PORT" != "22" ]] && SSH_P_OPT="-p ${SSH_PORT} "
+  printf '  %sSSH tunnel%s\n' "$BOLD" "$RESET" >&2
+  kv "SSH host" "${PUBLIC_IP}:${SSH_PORT}  ${DIM}(${IP_SOURCE})${RESET}"
+  kv "SSH user" "$TUNNEL_OS_USER"
+  kv "Private key" "$KEY_OUT"
+  # -N bắt buộc: tunnel user không có shell, thiếu -N thì SSH chạy lệnh mặc định rồi đóng luôn tunnel
+  kv "Connect" "${CYAN}ssh ${SSH_P_OPT}-i $(basename "$KEY_OUT") -N -L ${LOCAL_PORT}:${TUNNEL_TARGET} ${TUNNEL_OS_USER}@${PUBLIC_IP}${RESET}"
   blank
+  printf '  %sDBeaver%s\n' "$BOLD" "$RESET" >&2
+  kv "Tab SSH" "${PUBLIC_IP} · ${SSH_PORT} · ${TUNNEL_OS_USER} · Public Key"
+  kv "Tab Main" "${TGT_HOST} · ${TGT_PORT}"
+  blank
+fi
+
+if [[ "$DO_DB_USER" == "yes" ]]; then
   printf '  %sDatabase%s\n' "$BOLD" "$RESET" >&2
   kv "Engine" "$DB_ENGINE"
   kv "Host" "${DB_HOST}:${DB_PORT}$([[ "$IS_RDS" == "yes" ]] && printf '  (RDS)')"
@@ -2154,42 +2287,21 @@ if [[ "$DO_DB_USER" == "yes" ]]; then
   log "Kết quả: chạy SQL=${RUN_MODE} · verify grants=${VERIFY_STATUS} · test login=${LOGIN_STATUS}"
 fi
 
-if [[ "$DO_TUNNEL" == "yes" ]]; then
-  printf '  %sSSH tunnel%s\n' "$BOLD" "$RESET" >&2
-  kv "SSH host" "${PUBLIC_IP}:${SSH_PORT}"
-  kv "SSH user" "$TUNNEL_OS_USER"
-  kv "Private key" "$KEY_OUT"
-  kv "Forward tới" "$TUNNEL_TARGET"
-  blank
-  printf '  %sDBeaver%s\n' "$BOLD" "$RESET" >&2
-  kv "Tab SSH" "${PUBLIC_IP} · ${SSH_PORT} · ${TUNNEL_OS_USER} · Public Key"
-  kv "Tab Main" "${TGT_HOST} · ${TGT_PORT}"
-  blank
-fi
-
 # Chạy thành công: không in danh sách thay đổi (chỉ in khi thoát do lỗi), nhưng vẫn ghi CHANGES_FILE
 write_changes_file
-printf '  %sFile output%s\n' "$BOLD" "$RESET" >&2
-printf '  Link: %s\n' "$OUT_DIR" >&2
-
-blank
-printf '  %sXem lại credentials:%s\n' "$BOLD" "$RESET" >&2
 # Output được chuyển owner về user gọi sudo (give_output_to_sudo_user) → không cần sudo để đọc.
 # Chạy thẳng bằng root (không qua sudo) thì file vẫn thuộc root → giữ sudo trong gợi ý.
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then CAT_CMD="cat"; else CAT_CMD="sudo cat"; fi
-printf '    %s%s %q%s\n' "$CYAN" "$CAT_CMD" "$CRED_FILE" "$RESET" >&2
-
+printf '  %sFile output%s\n' "$BOLD" "$RESET" >&2
+kv "Link" "$OUT_DIR"
+kv "Credentials" "${CYAN}${CAT_CMD} $(printf '%q' "$CRED_FILE")${RESET}"
 if [[ "$DO_TUNNEL" == "yes" && -n "$KEY_OUT" ]]; then
-  # Lệnh chạy TRÊN MÁY LOCAL để kéo private key về. Đăng nhập bằng user đã gọi sudo
-  # (owner của output), không phải tunnel user (tunnel user không có shell nên scp không dùng được).
+  # Chạy TRÊN MÁY LOCAL để kéo private key về. Đăng nhập bằng user đã gọi sudo (owner của output),
+  # không phải tunnel user (tunnel user không có shell nên scp không dùng được).
   SCP_USER="${SUDO_USER:-<user>}"; [[ "$SCP_USER" == "root" ]] && SCP_USER="<user>"
   SCP_PORT_OPT=""; [[ "$SSH_PORT" != "22" ]] && SCP_PORT_OPT="-P ${SSH_PORT} "
-  blank
-  printf '  %sCopy private key về máy local%s %s(chạy trên máy local)%s:\n' "$BOLD" "$RESET" "$DIM" "$RESET" >&2
-  printf '    %sscp %s%s@%s:%q .%s\n' "$CYAN" "$SCP_PORT_OPT" "$SCP_USER" "$PUBLIC_IP" "$KEY_OUT" "$RESET" >&2
-  printf '    %schmod 600 %q%s\n' "$CYAN" "$(basename "$KEY_OUT")" "$RESET" >&2
+  kv "Copy private key" "${CYAN}scp ${SCP_PORT_OPT}${SCP_USER}@${PUBLIC_IP}:$(printf '%q' "$KEY_OUT") . && chmod 600 $(printf '%q' "$(basename "$KEY_OUT")")${RESET}"
 fi
-
 
 blank
 printf '  %s⚠ Nhắc nhở bảo mật%s\n' "$YELLOW" "$RESET" >&2
