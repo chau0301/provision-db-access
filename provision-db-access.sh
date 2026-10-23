@@ -5,6 +5,8 @@
 # Tạo DB user (mức quyền theo ACCESS_MODE) trên MySQL / MariaDB / PostgreSQL,
 # và (tuỳ chọn) tạo SSH account chỉ-dùng-để-tunnel (không shell) để connect tới DB đó.
 # Có chế độ xoá: gỡ tunnel user do script tạo (nhận diện qua TUNNEL_GECOS / Match block) và xoá DB user.
+# (Menu 4) Tạo SSH user có shell (tuỳ chọn sudo) cho từng người, thay cho việc dùng chung ec2-user / ubuntu
+# (nhận diện qua SHELL_GECOS; xoá bằng cùng chế độ xoá tunnel).
 #
 # Nguyên tắc an toàn:
 #   - Không thay đổi hệ thống/DB khi chưa có xác nhận rõ ràng; luôn hiện "kế hoạch" trước khi làm.
@@ -37,6 +39,7 @@ TUNNEL_SUFFIX="-db-tunnel"    # hậu tố gợi ý cho user OS tunnel
 OS_USER_MAX=32                # độ dài tối đa tên user Linux
 SSH_PORT=22                   # port SSH in ra trong credentials / hướng dẫn DBeaver
 TUNNEL_GECOS="DB tunnel only" # GECOS gắn cho user tunnel; dùng để nhận diện khi xoá
+SHELL_GECOS="SSH shell user"  # GECOS gắn cho SSH user có shell (menu 4); dùng để nhận diện khi xoá
 
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 # Khi chạy dưới `script` (ghi console), tiến trình con dùng lại timestamp của tiến trình cha
@@ -983,9 +986,9 @@ show_sql_masked() {
 # ============================== Xoá (drop) ================================
 
 confirm_typed() {
-  # confirm_typed "chuỗi" → bắt gõ lại đúng chuỗi mới cho xoá (chống nhấn y nhầm)
-  local want="$1" got
-  read -r -p "  ${RED}?${RESET} Gõ ${BOLD}${want}${RESET} để xác nhận XOÁ: " got || die "Không đọc được input."
+  # confirm_typed "chuỗi" [hành động] → bắt gõ lại đúng chuỗi (chống nhấn y nhầm). Hành động mặc định: XOÁ
+  local want="$1" action="${2:-XOÁ}" got
+  read -r -p "  ${RED}?${RESET} Gõ ${BOLD}${want}${RESET} để xác nhận ${action}: " got || die "Không đọc được input."
   [[ "$(trim "$got")" == "$want" ]]
 }
 
@@ -1082,19 +1085,19 @@ set_match_markers() {
 }
 
 list_tunnel_users() {
-  # Các user do script tạo: GECOS = TUNNEL_GECOS hoặc có Match block trong sshd_config
+  # Các user do script tạo: GECOS = TUNNEL_GECOS / SHELL_GECOS, hoặc có Match block trong sshd_config
   {
-    getent passwd | awk -F: -v g="$TUNNEL_GECOS" '$5==g {print $1}'
+    getent passwd | awk -F: -v g="$TUNNEL_GECOS" -v h="$SHELL_GECOS" '$5==g || $5==h {print $1}'
     sed -nE 's/^# >>> db-tunnel: ([^ ]+) .*/\1/p' /etc/ssh/sshd_config 2>/dev/null
   } | sort -u
 }
 
 drop_tunnel() {
-  step "Chọn tunnel cần xoá"
+  step "Chọn SSH tunnel / SSH user cần xoá"
   local all=() sel=() u i
   mapfile -t all < <(list_tunnel_users)
   if (( ${#all[@]} == 0 )); then
-    info "Không tìm thấy tunnel user nào do script tạo."
+    info "Không tìm thấy tunnel / SSH user nào do script tạo."
     STEP_TOTAL=$((STEP_NO + 1))
     return 0
   fi
@@ -1104,7 +1107,15 @@ drop_tunnel() {
   elif (( NONINTERACTIVE )); then
     die_code "$EXIT_USAGE" "Thiếu --tunnel-user (có: ${all[*]})."
   else
-    choose_multi "Tunnel user:" "${all[@]}"
+    local labels=() x kind
+    for x in "${all[@]}"; do
+      case "$(getent passwd "$x" | cut -d: -f5)" in
+        "$SHELL_GECOS") kind="shell"; [[ -f "$(sudoers_file_for "$x")" ]] && kind="shell + sudo" ;;
+        *) kind="tunnel" ;;
+      esac
+      labels+=("$(printf '%-28s (%s)' "$x" "$kind")")
+    done
+    choose_multi "User do script tạo:" "${labels[@]}"
   fi
   for i in "${CHOSEN[@]}"; do sel+=("${all[$i]}"); done
 
@@ -1125,18 +1136,19 @@ drop_tunnel() {
     grep -qF "$MATCH_BEGIN" "$SSHD_CFG" 2>/dev/null && has_match[$u]="yes"
     grep -Eq "^[[:space:]]*AllowUsers([[:space:]].*)?[[:space:]]${u}([[:space:]]|\$)" "$SSHD_CFG" && in_allow[$u]="yes"
     gecos=""; [[ "${has_user[$u]}" == "yes" ]] && gecos="$(getent passwd "$u" | cut -d: -f5)"
-    [[ "$gecos" == "$TUNNEL_GECOS" || "${has_match[$u]}" == "yes" ]] \
-      || die "'${u}' không phải user do script tạo (GECOS ≠ '${TUNNEL_GECOS}', không có Match block). Không xoá."
+    [[ "$gecos" == "$TUNNEL_GECOS" || "$gecos" == "$SHELL_GECOS" || "${has_match[$u]}" == "yes" ]] \
+      || die "'${u}' không phải user do script tạo (GECOS lạ, không có Match block). Không xoá."
     [[ "${has_match[$u]}" == "yes" || "${in_allow[$u]}" == "yes" ]] && need_cfg="yes"
   done
 
-  step "Xoá ${#sel[@]} tunnel"
+  step "Xoá ${#sel[@]} user"
   info "Kế hoạch:"
   for u in "${sel[@]}"; do
     note "• ${u}:"
     [[ "${has_match[$u]}" == "yes" ]] && note "    gỡ Match block trong sshd_config"
     [[ "${in_allow[$u]}" == "yes" ]] && note "    gỡ khỏi AllowUsers"
     (( ${n_proc[$u]} > 0 )) && note "    ngắt ${n_proc[$u]} tiến trình / tunnel đang mở"
+    [[ -f "$(sudoers_file_for "$u")" ]] && note "    gỡ sudo: xoá $(sudoers_file_for "$u")"
     [[ "${has_user[$u]}" == "yes" ]] && note "    userdel -r (xoá cả home, authorized_keys)"
   done
   note "• Private key đã giao trước đây sẽ không dùng được nữa"
@@ -1185,8 +1197,12 @@ drop_tunnel() {
       userdel -r "$u" >>"$LOG_FILE" 2>&1 || die "userdel -r ${u} thất bại — xem log."
       record "Xoá user OS '${u}' (home + authorized_keys)" "Tạo lại bằng script (key cũ không khôi phục được)"
     fi
-    ok "Đã xoá tunnel '${u}'"
-    DROPPED+=("tunnel '${u}'")
+    if [[ -f "$(sudoers_file_for "$u")" ]]; then
+      rm -f -- "$(sudoers_file_for "$u")"
+      record "Xoá $(sudoers_file_for "$u") (gỡ sudo của '${u}')" "Cấp lại bằng script"
+    fi
+    ok "Đã xoá '${u}'"
+    DROPPED+=("'${u}'")
   done
 }
 
@@ -1385,8 +1401,257 @@ finish_drop() {
   blank
   printf '%s%s%s\n✔ Hoàn tất\n%s%s\n\n' "$BOLD" "$GREEN" "$RULE" "$RULE" "$RESET" >&2
   log "===== Hoàn tất (xoá) ====="
-  emit_json status ok action "$([[ "$SCOPE_IDX" == 4 ]] && echo drop-tunnel || echo drop-db-user)" \
+  emit_json status ok action "$([[ "$SCOPE_IDX" == 5 ]] && echo drop-tunnel || echo drop-db-user)" \
     dropped "$(json_array "${DROPPED[@]}")" output_dir "$OUT_DIR" changes_file "$CHANGES_FILE" log_file "$LOG_FILE"
+  exit 0
+}
+
+# ============================== SSH user (shell, tuỳ chọn sudo) ==========
+# Menu 4. Tài khoản SSH riêng cho từng người (thay vì dùng chung ec2-user / ubuntu). Chỉ đăng nhập bằng key;
+# password (nếu có) chỉ dùng cho sudo. Nhận diện để xoá qua SHELL_GECOS + Match block có marker.
+
+sudoers_file_for() { printf '/etc/sudoers.d/90-ssh-user-%s' "$1"; }
+
+create_ssh_user() {
+  step "Thông tin SSH user"
+  note "Tài khoản riêng cho từng người, thay cho việc dùng chung ec2-user / ubuntu"
+  local u gecos pubkey="" fp ak_tmp sudo_tmp sf svc
+  ask SSH_NEW_USER "Username" "" "^[a-z_][a-z0-9_-]{0,$(( OS_USER_MAX - 1 ))}\$" \
+    "Chỉ dùng a-z, 0-9, _ , - ; bắt đầu bằng chữ; tối đa ${OS_USER_MAX} ký tự."
+  u="$SSH_NEW_USER"
+  [[ "$u" != "root" && "$u" != "${SUDO_USER:-}" ]] || die "Không dùng '${u}'."
+  local existed="no"
+  if id "$u" &>/dev/null; then
+    gecos="$(getent passwd "$u" | cut -d: -f5)"
+    [[ "$gecos" == "$SHELL_GECOS" ]] \
+      || die "User '${u}' đã có trên server và không do script tạo (GECOS='${gecos}'). Không đụng tới."
+    existed="yes"
+    info "User '${u}' đã có (do script tạo) → cập nhật key / sudo."
+  fi
+
+  # ---- Key: mặc định dán public key của người dùng (private key không rời máy họ)
+  blank
+  choose KEYSRC_IDX "SSH key:" \
+    "Dán public key của người dùng (khuyến nghị)" \
+    "Sinh cặp key mới ed25519 vào thư mục output"
+  if [[ "$KEYSRC_IDX" == "1" ]]; then
+    note "Trên máy người dùng: cat ~/.ssh/id_ed25519.pub  (chưa có thì: ssh-keygen -t ed25519)"
+    local kf; kf="$(mktemp "${OUT_DIR}/.pub.XXXXXX")"; TMP_FILES+=("$kf")
+    while true; do
+      read -r -p "  ${CYAN}›${RESET} Public key: " pubkey || die "Không đọc được input."
+      pubkey="$(trim "$pubkey")"
+      if [[ "$pubkey" == *"PRIVATE KEY"* ]]; then warn "Đây là PRIVATE key — chỉ dán PUBLIC key (.pub)."; continue; fi
+      printf '%s\n' "$pubkey" >"$kf"
+      if fp="$(ssh-keygen -lf "$kf" 2>/dev/null)"; then ok "Key hợp lệ: $(awk '{print $2, $NF}' <<<"$fp")"; break; fi
+      warn "Không phải public key hợp lệ (dạng: ssh-ed25519 AAAA… comment)."
+    done
+    KEY_OUT=""
+  fi
+
+  # ---- Sudo
+  blank
+  choose SUDO_IDX "Quyền sudo:" \
+    "Không sudo" \
+    "sudo không cần password (giống ec2-user / ubuntu)" \
+    "sudo cần password (script sinh password)"
+  case "$SUDO_IDX" in 1) SUDO_MODE="none" ;; 2) SUDO_MODE="nopasswd" ;; 3) SUDO_MODE="password" ;; esac
+  if [[ "$SUDO_MODE" != "none" ]]; then
+    command -v visudo >/dev/null 2>&1 || die "Không có visudo (gói sudo) — không kiểm tra được sudoers."
+    warn "sudo = TOÀN QUYỀN root trên server: đọc mọi file (.env, key), sửa mọi config, tạo/xoá user."
+    note "Chỉ cấp cho người vận hành server. Thu hồi: chạy lại script → 5) Xoá SSH tunnel / SSH user."
+    confirm_typed "$u" "CẤP SUDO" || die "Không khớp. Huỷ, chưa thay đổi gì."
+  fi
+
+  # ---- Khảo sát sshd (chỉ đọc)
+  SSHD_CFG="/etc/ssh/sshd_config"
+  SSHD_BIN="$(find_sshd_bin)"; [[ -n "$SSHD_BIN" ]] || die "Không thấy sshd (openssh-server chưa cài?)."
+  if ! sshd_check; then
+    err "sshd_config hiện tại ĐÃ lỗi sẵn (trước khi script sửa gì):"; codeblock "$SSHD_T_OUT"
+    die "Sửa sshd_config trước rồi chạy lại. Chưa thay đổi gì."
+  fi
+  local eff allow_users allow_groups need_allow="no" match_exists="no"
+  eff="$("$SSHD_BIN" -T 2>>"$LOG_FILE" || true)"
+  allow_users="$(awk '$1=="allowusers"{print $2}' <<<"$eff")"
+  allow_groups="$(awk '$1=="allowgroups"{print $2}' <<<"$eff")"
+  if [[ -n "$allow_users" ]] && ! grep -qxF "$u" <<<"$allow_users"; then
+    need_allow="yes"; grep -Eq '^[[:space:]]*AllowUsers[[:space:]]' "$SSHD_CFG" || need_allow="manual"
+  fi
+  set_match_markers "$u"
+  grep -qF "$MATCH_BEGIN" "$SSHD_CFG" && match_exists="yes"
+  sf="$(sudoers_file_for "$u")"
+
+  # ---- Kế hoạch
+  step "Áp dụng thay đổi"
+  info "Kế hoạch:"
+  if [[ "$existed" == "yes" ]]; then note "• User '${u}' đã có → giữ nguyên"
+  else note "• Tạo user '${u}' (shell /bin/bash, home /home/${u})"; fi
+  if [[ "$KEYSRC_IDX" == "1" ]]; then note "• authorized_keys: thêm public key đã dán (thay key cũ do script thêm)"
+  else note "• Sinh key ed25519 vào thư mục output, thêm public key vào authorized_keys"; fi
+  case "$SUDO_MODE" in
+    none)     [[ -f "$sf" ]] && note "• Gỡ sudo: xoá ${sf}" ;;
+    nopasswd) note "• sudo không password: ${sf} (kiểm tra bằng visudo)" ;;
+    password) note "• sudo cần password: ${sf} + đặt password (chỉ dùng cho sudo, không SSH bằng password)" ;;
+  esac
+  case "$need_allow" in
+    yes)    note "• AllowUsers: thêm '${u}'" ;;
+    manual) note "• ⚠ AllowUsers khai báo ngoài ${SSHD_CFG} → bạn cần tự thêm '${u}'" ;;
+  esac
+  [[ -n "$allow_groups" ]] && note "• ⚠ sshd có AllowGroups (${allow_groups//$'\n'/ }) → user cần thuộc 1 group trong đó"
+  note "• sshd_config: Match block chỉ cho đăng nhập bằng key → sshd -t (lỗi → rollback) → reload"
+  blank
+  confirm "Tiến hành?" n y || die "Huỷ theo yêu cầu. Chưa có gì bị thay đổi."
+
+  # 1. User
+  if [[ "$existed" == "no" ]]; then
+    useradd -m -s /bin/bash -c "$SHELL_GECOS" "$u"
+    ok "Đã tạo user '${u}'"
+    record "Tạo user OS '${u}' (shell)" "userdel -r ${u}"
+  fi
+  local grp; grp="$(id -gn "$u")"
+
+  # 2. Key
+  if [[ "$KEYSRC_IDX" == "2" ]]; then
+    KEY_OUT="${OUT_DIR}/${u}-key"
+    ssh-keygen -q -t ed25519 -f "$KEY_OUT" -C "${u}@$(hostname -s 2>/dev/null || echo server)" -N ""
+    chmod 600 "$KEY_OUT"
+    pubkey="$(<"${KEY_OUT}.pub")"
+    ok "Key: $(basename "$KEY_OUT") · $(ssh-keygen -lf "${KEY_OUT}.pub" | awk '{print $2}')"
+  fi
+  local tag="[ssh-user:${u}]" home ssh_dir ak
+  home="$(getent passwd "$u" | cut -d: -f6)"; ssh_dir="${home}/.ssh"; ak="${ssh_dir}/authorized_keys"
+  install -d -m 700 -o "$u" -g "$grp" "$ssh_dir"
+  backup_file "$ak" AK_BAK
+  ak_tmp="$(mktemp "${ssh_dir}/.authorized_keys.XXXXXX")"; TMP_FILES+=("$ak_tmp")
+  if [[ -f "$ak" ]]; then grep -vF "$tag" "$ak" >"$ak_tmp" || true; fi
+  printf '%s %s\n' "$pubkey" "$tag" >>"$ak_tmp"
+  chmod 600 "$ak_tmp"; chown "${u}:${grp}" "$ak_tmp"; mv -f "$ak_tmp" "$ak"
+  ok "authorized_keys: đã thêm key"
+  if [[ -n "$AK_BAK" ]]; then record "Sửa ${ak} (entry ${tag})" "cp -p ${AK_BAK} ${ak}"
+  else record "Tạo ${ak} (entry ${tag})" "rm -f ${ak}"; fi
+
+  # 3. Sudo (file riêng trong sudoers.d, kiểm tra bằng visudo TRƯỚC khi đặt vào chỗ)
+  SUDO_PASS=""
+  if [[ "$SUDO_MODE" == "none" ]]; then
+    if [[ -f "$sf" ]]; then rm -f -- "$sf"; ok "Đã gỡ sudo (${sf})"; record "Xoá ${sf} (gỡ sudo của '${u}')" "Cấp lại bằng script"; fi
+  else
+    sudo_tmp="$(mktemp)"; TMP_FILES+=("$sudo_tmp")
+    if [[ "$SUDO_MODE" == "nopasswd" ]]; then
+      printf '# managed by %s — %s\n%s ALL=(ALL) NOPASSWD:ALL\n' "$SCRIPT_NAME" "$(date '+%F %T')" "$u" >"$sudo_tmp"
+    else
+      printf '# managed by %s — %s\n%s ALL=(ALL:ALL) ALL\n' "$SCRIPT_NAME" "$(date '+%F %T')" "$u" >"$sudo_tmp"
+    fi
+    visudo -cf "$sudo_tmp" >>"$LOG_FILE" 2>&1 || die "File sudoers sinh ra không hợp lệ (visudo). Chưa cấp sudo."
+    install -m 440 -o root -g root "$sudo_tmp" "$sf"
+    if ! visudo -c >>"$LOG_FILE" 2>&1; then
+      rm -f -- "$sf"; die "visudo -c báo lỗi sau khi thêm ${sf} → đã gỡ file. Kiểm tra /etc/sudoers."
+    fi
+    ok "sudo: ${sf} (visudo OK)"
+    record "Tạo ${sf} (sudo ${SUDO_MODE} cho '${u}')" "rm -f ${sf}"
+    if [[ "$SUDO_MODE" == "password" ]]; then
+      SUDO_PASS="$(gen_password)"
+      printf '%s:%s\n' "$u" "$SUDO_PASS" | chpasswd
+      ok "Đã đặt password cho sudo (→ $(basename "$CRED_FILE"))"
+      record "Đặt password cho '${u}' (dùng cho sudo)" "passwd -l ${u}"
+    fi
+  fi
+
+  # 4. sshd_config: AllowUsers + Match block (chỉ key, không password)
+  backup_file "$SSHD_CFG" SSHD_BAK
+  if [[ "$need_allow" == "yes" ]]; then
+    sed -i -E "0,/^([[:space:]]*AllowUsers)([[:space:]])/s//\1 ${u}\2/" "$SSHD_CFG"
+    ok "AllowUsers += ${u}"
+  elif [[ "$need_allow" == "manual" ]]; then
+    warn "Nhớ tự thêm '${u}' vào AllowUsers (đang khai báo ngoài ${SSHD_CFG})."
+  fi
+  if [[ "$match_exists" == "yes" ]]; then
+    local cfg_tmp; cfg_tmp="$(mktemp)"; TMP_FILES+=("$cfg_tmp")
+    awk -v b="$MATCH_BEGIN" -v e="$MATCH_END" '$0==b{skip=1;next} skip&&$0==e{skip=0;next} !skip{print}' "$SSHD_CFG" >"$cfg_tmp"
+    cat "$cfg_tmp" >"$SSHD_CFG"
+  fi
+  [[ -n "$(tail -n 1 "$SSHD_CFG")" ]] && printf '\n' >>"$SSHD_CFG"
+  {
+    printf '%s\n' "$MATCH_BEGIN"
+    printf 'Match User %s\n' "$u"
+    printf '    AuthenticationMethods publickey\n'
+    printf '    PasswordAuthentication no\n'
+    printf '    KbdInteractiveAuthentication no\n'
+    printf '%s\n' "$MATCH_END"
+  } >>"$SSHD_CFG"
+  record "Ghi Match block / AllowUsers cho '${u}' vào ${SSHD_CFG}" "cp -p ${SSHD_BAK} ${SSHD_CFG}"
+  if sshd_check; then
+    ok "sshd -t OK"
+  else
+    err "sshd -t báo lỗi sau khi sửa:"; codeblock "$SSHD_T_OUT"
+    cp -p -- "$SSHD_BAK" "$SSHD_CFG"
+    record "ĐÃ ROLLBACK ${SSHD_CFG} về ${SSHD_BAK} (sshd -t lỗi)" ""
+    die "Đã rollback ${SSHD_CFG}. sshd KHÔNG bị reload."
+  fi
+  local evid="${EVIDENCE_DIR}/ssh_user_${u}.txt"
+  {
+    printf '== sshd -T -C user=%s\n' "$u"; { "$SSHD_BIN" -T -C "user=${u},host=localhost,addr=127.0.0.1" 2>&1 || true; } \
+      | { grep -Ei '^(authenticationmethods|passwordauthentication|permittty|allowtcpforwarding) ' || true; }
+    printf '\n== sudo -l -U %s\n' "$u"; sudo -l -U "$u" 2>&1 || true
+  } >"$evid"
+  if grep -qi '^authenticationmethods publickey' "$evid"; then ok "Hiệu lực: chỉ đăng nhập bằng key"
+  else warn "Chưa thấy 'AuthenticationMethods publickey' hiệu lực cho '${u}' — xem ${evid}"; fi
+  svc="$(find_ssh_service)"
+  if [[ -n "$svc" ]] && systemctl is-active --quiet "$svc"; then
+    if confirm "Reload ${svc}? (không rớt session)" y y; then
+      systemctl reload "$svc" || die "Reload thất bại — kiểm tra tay. KHÔNG restart để tránh mất kết nối."
+      ok "Reload ${svc}: xong"
+    else
+      warn "Chưa reload — chạy: systemctl reload ${svc}"
+    fi
+  fi
+
+  # ---- Credentials + Tổng kết
+  detect_server_ip
+  local ssh_p_opt="" scp_p_opt="" conn
+  [[ "$SSH_PORT" != "22" ]] && { ssh_p_opt="-p ${SSH_PORT} "; scp_p_opt="-P ${SSH_PORT} "; }
+  conn="ssh ${ssh_p_opt}${KEY_OUT:+-i $(basename "$KEY_OUT") }${u}@${PUBLIC_IP}"
+  {
+    printf '# %s v%s — %s\n# File chứa bí mật. Lấy xong thì XOÁ khỏi server.\n\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$(date '+%F %T')"
+    printf '[ssh_user]\nhost     = %s\nport     = %s\nuser     = %s\nsudo     = %s\n' "$PUBLIC_IP" "$SSH_PORT" "$u" "$SUDO_MODE"
+    [[ -n "$SUDO_PASS" ]] && printf 'sudo_password = %s\n' "$SUDO_PASS"
+    [[ -n "${KEY_OUT:-}" ]] && printf 'private_key = %s\n' "$(basename "$KEY_OUT")"
+    printf '\n# Connect: %s\n' "$conn"
+  } >"$CRED_FILE"
+  chmod 600 "$CRED_FILE"
+  write_changes_file
+
+  step "Tổng kết"
+  local show="no" sudo_label
+  [[ -n "$SUDO_PASS" ]] && confirm "Hiện password sudo?" && show="yes"
+  case "$SUDO_MODE" in none) sudo_label="không" ;; nopasswd) sudo_label="có, không cần password" ;; password) sudo_label="có, cần password" ;; esac
+  blank
+  printf '  %sSSH user%s\n' "$BOLD" "$RESET" >&2
+  kv "SSH host" "${PUBLIC_IP}:${SSH_PORT}  ${DIM}(${IP_SOURCE})${RESET}"
+  kv "User" "$u"
+  kv "Sudo" "$sudo_label"
+  if [[ -n "$SUDO_PASS" ]]; then
+    if [[ "$show" == "yes" ]]; then kv "Password sudo" "$SUDO_PASS"
+    else kv "Password sudo" "$(mask "$SUDO_PASS")  ${DIM}(xem $(basename "$CRED_FILE"))${RESET}"; fi
+  fi
+  if [[ -n "${KEY_OUT:-}" ]]; then kv "Private key" "$KEY_OUT"
+  else kv "Key" "public key người dùng đã dán · $(awk '{print $2}' <<<"${fp:-}")"; fi
+  kv "Connect" "${CYAN}${conn}${RESET}"
+  blank
+  local cat_cmd="sudo cat"; [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && cat_cmd="cat"
+  printf '  %sFile output%s\n' "$BOLD" "$RESET" >&2
+  kv "Link" "$OUT_DIR"
+  kv "Credentials" "${CYAN}${cat_cmd} $(printf '%q' "$CRED_FILE")${RESET}"
+  if [[ -n "${KEY_OUT:-}" ]]; then
+    local scp_user="${SUDO_USER:-<user>}"; [[ "$scp_user" == "root" ]] && scp_user="<user>"
+    kv "Copy private key" "${CYAN}scp ${scp_p_opt}${scp_user}@${PUBLIC_IP}:$(printf '%q' "$KEY_OUT") . && chmod 600 $(printf '%q' "$(basename "$KEY_OUT")")${RESET}"
+  fi
+  blank
+  printf '  %s⚠ Nhắc nhở bảo mật%s\n' "$YELLOW" "$RESET" >&2
+  note "• Thử đăng nhập bằng user mới ở cửa sổ khác TRƯỚC khi đóng phiên hiện tại."
+  note "• Security Group / firewall: chỉ whitelist IP cần thiết cho port ${SSH_PORT} (SSH)."
+  note "• Xoá:  rm -rf ${OUT_DIR} hoặc xoá output của mọi lần chạy:  rm -rf ${OUT_BASE}"
+  blank
+  printf '%s%s%s\n✔ Hoàn tất\n%s%s\n\n' "$BOLD" "$GREEN" "$RULE" "$RULE" "$RESET" >&2
+  log "===== Hoàn tất (SSH user) ====="
   exit 0
 }
 
@@ -1472,8 +1737,8 @@ set_opt() {
     action)
       case "$2" in
         create) ;;
-        drop-tunnel)  OPT[scope-idx]=4 ;;
-        drop-db-user) OPT[scope-idx]=5 ;;
+        drop-tunnel)  OPT[scope-idx]=5 ;;
+        drop-db-user) OPT[scope-idx]=6 ;;
         *) die_code "$EXIT_USAGE" "--action=$2 không hợp lệ (create | drop-tunnel | drop-db-user)." ;;
       esac
       OPT[action]="$2" ;;
@@ -1615,14 +1880,16 @@ choose SCOPE_IDX "Phạm vi:" \
   "DB user + SSH tunnel" \
   "Chỉ DB user" \
   "Chỉ SSH tunnel" \
-  "Xoá SSH tunnel" \
+  "SSH User (Shell)" \
+  "Xoá SSH tunnel / SSH user" \
   "Xoá DB user"
 case "$SCOPE_IDX" in
   1) DO_DB_USER="yes"; DO_TUNNEL="yes"; STEP_TOTAL=7 ;;
   2) DO_DB_USER="yes"; DO_TUNNEL="no";  STEP_TOTAL=5 ;;
   3) DO_DB_USER="no";  DO_TUNNEL="yes"; STEP_TOTAL=4 ;;
-  4) DROPPED=(); STEP_TOTAL=3; MYSQL_HOST_PART="%"; drop_tunnel;  finish_drop ;;
-  5) DROPPED=(); STEP_TOTAL=5; MYSQL_HOST_PART="%"; drop_db_user; finish_drop ;;
+  4) STEP_TOTAL=3; KEY_OUT=""; create_ssh_user ;;
+  5) DROPPED=(); STEP_TOTAL=3; MYSQL_HOST_PART="%"; drop_tunnel;  finish_drop ;;
+  6) DROPPED=(); STEP_TOTAL=5; MYSQL_HOST_PART="%"; drop_db_user; finish_drop ;;
 esac
 log "Scope: DO_DB_USER=${DO_DB_USER} DO_TUNNEL=${DO_TUNNEL}"
 
